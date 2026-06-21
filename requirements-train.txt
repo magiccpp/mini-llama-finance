@@ -1,0 +1,24 @@
+# Training dependencies for the CUDA Docker image.
+# torch/torchvision come pre-installed in the pytorch/pytorch base image.
+# XPU-specific packages (intel_extension_for_pytorch, pytorch-triton-xpu)
+# are intentionally excluded — they conflict with CUDA builds.
+
+# HuggingFace stack
+transformers>=4.46.0
+huggingface_hub>=0.24.0
+accelerate>=0.26.0
+datasets>=2.18.0
+tokenizers>=0.20.0
+sentencepiece>=0.1.99
+protobuf>=4.25.0
+
+# Training utilities
+bitsandbytes>=0.43.0      # 4-bit / 8-bit quantisation (CUDA only)
+scipy>=1.12.0             # needed by some transformers internals
+tqdm>=4.66.0
+ujson>=5.9.0
+
+# Text processing (also used by processors/ and eval scripts)
+ftfy>=6.1.3
+nltk>=3.8.1
+tiktoken>=0.6.0
