@@ -96,8 +96,25 @@ def _ipex_optimize_model(model, is_llm: bool = False, dtype=torch.bfloat16):
         LOG.warning("IPEX optimisation skipped (%s: %s); model runs on XPU without it.", type(e).__name__, e)
         return model
 
-FINBERT_MODEL = "ProsusAI/finbert"
-LLAMA_MODEL   = "meta-llama/Meta-Llama-3.1-8B"
+# Model registry — add new models here; the rest of the script picks them up.
+# type: "masked_lm"  → pseudo-perplexity via per-token masking (BERT-style)
+#       "causal_lm"  → standard sliding-window NLL perplexity (GPT-style)
+# gated: True means a HuggingFace token (HF_TOKEN env var) is required.
+MODEL_REGISTRY: dict[str, dict] = {
+    # --- BERT-style encoder ---
+    "finbert":    {"id": "ProsusAI/finbert",             "type": "masked_lm", "gated": False},
+    # --- Llama ---
+    "llama-8b":   {"id": "meta-llama/Meta-Llama-3.1-8B", "type": "causal_lm", "gated": True},
+    # --- Qwen3  (no gate; sizes closest to 0.8 B / 2 B / 4 B / 8 B) ---
+    "qwen3-0.6b": {"id": "Qwen/Qwen3-0.6B",             "type": "causal_lm", "gated": False},
+    "qwen3-1.7b": {"id": "Qwen/Qwen3-1.7B",             "type": "causal_lm", "gated": False},
+    "qwen3-4b":   {"id": "Qwen/Qwen3-4B",               "type": "causal_lm", "gated": False},
+    "qwen3-8b":   {"id": "Qwen/Qwen3-8B",               "type": "causal_lm", "gated": False},
+}
+
+# Keep these as convenient aliases for the old CLI flags
+FINBERT_MODEL = MODEL_REGISTRY["finbert"]["id"]
+LLAMA_MODEL   = MODEL_REGISTRY["llama-8b"]["id"]
 
 
 # ---------------------------------------------------------------------------
@@ -399,13 +416,14 @@ def print_results(results: list[dict]):
     valid = [r for r in results if "ppl_mean" in r]
     if len(valid) >= 2:
         print("\n  COMPARISON  (lower PPL = better fit to financial text)")
-        print(f"  {'Model':<28} {'Device':<8} {'PPL mean':>10}  {'PPL median':>10}  {'Time/doc':>9}")
-        print("  " + "-" * 72)
+        print(f"  {'Model key':<14} {'HF model':<32} {'Device':<6} {'PPL mean':>10}  {'PPL median':>10}  {'Time/doc':>9}")
+        print("  " + "-" * 85)
         for r in sorted(valid, key=lambda x: x["ppl_mean"]):
-            short    = r["model"].split("/")[-1]
-            dev      = r.get("device", "?")
-            per_doc  = r["elapsed_s"] / r["samples"] if r["samples"] else 0
-            print(f"  {short:<28} {dev:<8} {r['ppl_mean']:>10.2f}  {r['ppl_median']:>10.2f}  {per_doc:>7.2f}s")
+            key     = r.get("key", r["model"].split("/")[-1])
+            hf_id   = r["model"].split("/")[-1]
+            dev     = r.get("device", "?")
+            per_doc = r["elapsed_s"] / r["samples"] if r.get("samples") else 0
+            print(f"  {key:<14} {hf_id:<32} {dev:<6} {r['ppl_mean']:>10.2f}  {r['ppl_median']:>10.2f}  {per_doc:>7.2f}s")
         print()
 
 
@@ -414,25 +432,26 @@ def print_results(results: list[dict]):
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Perplexity eval for financial news data")
+    model_keys = ", ".join(MODEL_REGISTRY)
+    parser = argparse.ArgumentParser(
+        description="Perplexity eval for financial news data",
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
     parser.add_argument("--data", default="data/raw/news_bulk/news_bulk_test.jsonl",
                         help="Path to JSONL test file")
-    parser.add_argument("--models", default="finbert,llama",
-                        help="Comma-separated: finbert,llama  (default: both)")
-    parser.add_argument("--finbert-samples", type=int, default=200,
-                        help="Number of docs for FinBERT (default 200)")
-    parser.add_argument("--llama-samples", type=int, default=20,
-                        help="Number of docs for Llama (default 20; slow on CPU)")
+    parser.add_argument("--models", default="finbert,llama-8b",
+                        help=f"Comma-separated model keys (default: finbert,llama-8b)\n"
+                             f"Available: {model_keys}")
+    parser.add_argument("--samples", type=int, default=100,
+                        help="Number of docs to evaluate per model (default 100)")
     parser.add_argument("--max-tokens", type=int, default=256,
                         help="Max tokens per document (default 256)")
     parser.add_argument("--stride", type=int, default=128,
-                        help="Sliding-window stride for Llama (default 128)")
+                        help="Sliding-window stride for causal LMs (default 128)")
     parser.add_argument("--load-in-4bit", action="store_true",
-                        help="Load Llama in 4-bit quantisation (requires CUDA + bitsandbytes)")
-    parser.add_argument("--finbert-model", default=FINBERT_MODEL)
-    parser.add_argument("--llama-model",   default=LLAMA_MODEL)
+                        help="Load causal LMs in 4-bit quantisation (requires CUDA + bitsandbytes)")
     parser.add_argument("--device", default="auto",
-                        help="Device: auto | cpu | cuda | cuda:0 (default: auto)")
+                        help="Device: auto | cpu | cuda | xpu (default: auto → CUDA→XPU→CPU)")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO,
@@ -455,63 +474,67 @@ def main():
             LOG.error(
                 "XPU requested but not available.\n"
                 "  Required: PyTorch XPU build + intel_extension_for_pytorch + Level Zero.\n"
-                "  Use the 'xpu-test' conda env:\n"
-                "    conda run -n xpu-test python eval_perplexity.py --device xpu ...\n"
+                "  Use the xpu-test conda env:\n"
+                "    /home/ken/anaconda3/envs/xpu-test/bin/python eval_perplexity.py --device xpu\n"
                 "  Falling back to CPU."
             )
             device = "cpu"
         else:
-            xpu_name = torch.xpu.get_device_name(0) if torch.xpu.is_available() else "unknown"
+            xpu_name = torch.xpu.get_device_name(0)
             xpu_mem  = torch.xpu.get_device_properties(0).total_memory // 1024**2
             LOG.info("XPU device: %s  (%d MB)", xpu_name, xpu_mem)
 
     LOG.info("Using device: %s", device)
     if device == "cpu":
         LOG.warning(
-            "Running on CPU. "
-            "FinBERT: fast.  Llama 3.1 8B: ~1–3 tok/s, expect %d–%d min for %d docs.\n"
-            "  Tip: use --device xpu with the xpu-test conda env for Intel Arc acceleration.",
-            args.llama_samples * args.max_tokens // 60,
-            args.llama_samples * args.max_tokens * 3 // 60,
-            args.llama_samples,
+            "Running on CPU — causal LMs will be slow (~1–3 tok/s).\n"
+            "  Tip: use --device xpu with the xpu-test conda env for Intel Arc acceleration."
         )
 
-    models_to_run = {m.strip().lower() for m in args.models.split(",")}
-    results = []
+    # Parse and validate requested models
+    requested = [m.strip().lower() for m in args.models.split(",") if m.strip()]
+    unknown = [m for m in requested if m not in MODEL_REGISTRY]
+    if unknown:
+        parser.error(f"Unknown model key(s): {unknown}\nAvailable: {model_keys}")
+
+    hf_token  = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
     data_path = Path(args.data)
+    texts_cache: dict[int, list[str]] = {}   # sample-count → texts (avoid re-reading)
+    results: list[dict] = []
 
-    # ----- FinBERT -----
-    if "finbert" in models_to_run:
-        texts = load_texts(data_path, args.finbert_samples)
-        LOG.info("Running FinBERT pseudo-perplexity on %d docs...", len(texts))
-        res = compute_finbert_pseudo_ppl(
-            texts,
-            model_name=args.finbert_model,
-            max_tokens=args.max_tokens,
-            device=device,
-        )
-        results.append(res)
-        LOG.info("FinBERT done: PPL mean=%.2f", res.get("ppl_mean", float("nan")))
+    for key in requested:
+        entry      = MODEL_REGISTRY[key]
+        model_id   = entry["id"]
+        model_type = entry["type"]
+        gated      = entry["gated"]
 
-    # ----- Llama -----
-    if "llama" in models_to_run:
-        texts = load_texts(data_path, args.llama_samples)
-        LOG.info("Running Llama perplexity on %d docs...", len(texts))
-        LOG.info("Llama model: %s  (set HF_TOKEN env var if gated)", args.llama_model)
-        res = compute_llama_ppl(
-            texts,
-            model_name=args.llama_model,
-            max_tokens=args.max_tokens,
-            stride=args.stride,
-            device=device,
-            load_in_4bit=args.load_in_4bit,
-        )
+        if gated and not hf_token:
+            LOG.warning(
+                "Model %s is gated — set HF_TOKEN env var or run `huggingface-cli login`.", key
+            )
+
+        if args.samples not in texts_cache:
+            texts_cache[args.samples] = load_texts(data_path, args.samples)
+        texts = texts_cache[args.samples]
+
+        LOG.info("--- %s (%s, %s) ---", key, model_id, model_type)
+
+        if model_type == "masked_lm":
+            res = compute_finbert_pseudo_ppl(
+                texts, model_name=model_id, max_tokens=args.max_tokens, device=device,
+            )
+        else:  # causal_lm
+            res = compute_llama_ppl(
+                texts, model_name=model_id, max_tokens=args.max_tokens,
+                stride=args.stride, device=device, load_in_4bit=args.load_in_4bit,
+            )
+
+        res["key"] = key   # short name for comparison table
         results.append(res)
-        LOG.info("Llama done: PPL mean=%.2f", res.get("ppl_mean", float("nan")))
+        LOG.info("%s done: PPL mean=%.2f", key, res.get("ppl_mean", float("nan")))
 
     print_results(results)
 
-    # Save JSON results next to the data file
     out = data_path.parent / "perplexity_results.json"
     with open(out, "w") as fh:
         json.dump(results, fh, indent=2)
